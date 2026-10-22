@@ -27,10 +27,21 @@ static struct qcomtee_object_ops ops = {
 	.release = qcomtee_callback_obj_release,
 };
 
+/*
+ * Optional hook for the library that owns the MINK object wrapping a dma-buf.
+ * It returns a new reference to a memory object for @obj, NULL if @obj does
+ * not wrap a dma-buf, or an ERR value through @err when registration fails.
+ */
+struct qcomtee_object *
+mink_adaptor_memory_object(Object obj, struct qcomtee_object *root, int *err)
+	__attribute__((weak));
+
 /* References a conversion takes. Objects it only borrows are not recorded. */
 enum conv_ref {
 	/* A new callback object, which QTEE takes over once it is delivered. */
 	CONV_CREATED,
+	/* A memory object reference, dropped once the call is done. */
+	CONV_MEMORY,
 };
 
 #define CONV_MAX \
@@ -55,7 +66,8 @@ static void conv_add(struct conv *conv, struct qcomtee_object *object,
 static void conv_put(struct conv *conv, int delivered)
 {
 	for (size_t i = 0; i < conv->num; i++) {
-		if (conv->refs[i] == CONV_CREATED && !delivered)
+		if (conv->refs[i] == CONV_MEMORY ||
+		    (conv->refs[i] == CONV_CREATED && !delivered))
 			qcomtee_object_refs_dec(conv->objs[i]);
 	}
 
@@ -111,6 +123,18 @@ qcomtee_obj_from_mink_obj(struct qcomtee_object *root_object, Object obj,
 	} else if (obj.invoke == invoke_over_tee) {
 		*object = (struct qcomtee_object *)obj.context;
 		return Object_OK;
+	} else if (mink_adaptor_memory_object) {
+		int err = Object_OK;
+		struct qcomtee_object *mo =
+			mink_adaptor_memory_object(obj, root_object, &err);
+
+		if (err)
+			return err;
+		if (mo) {
+			conv_add(conv, mo, CONV_MEMORY);
+			*object = mo;
+			return Object_OK;
+		}
 	}
 
 	{
