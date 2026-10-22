@@ -35,11 +35,6 @@
 
 struct qcomtee_callback_obj {
 	struct qcomtee_object object;
-	/* To satify the IDL interface, each BO argument passed to a
-	 * to a MINK Callback Object must be initialized with a valid
-	 * pointer. Allocated pointers are stored here to be free'd later.
-	 */
-	void *allocated_bo[ObjectCounts_maxBO];
 	Object mink_obj;
 };
 

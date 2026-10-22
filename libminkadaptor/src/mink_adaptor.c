@@ -27,18 +27,83 @@ static struct qcomtee_object_ops ops = {
 	.release = qcomtee_callback_obj_release,
 };
 
+/* References a conversion takes. Objects it only borrows are not recorded. */
+enum conv_ref {
+	/* A new callback object, which QTEE takes over once it is delivered. */
+	CONV_CREATED,
+};
+
+#define CONV_MAX \
+	(ObjectCounts_maxOI > ObjectCounts_maxOO ? ObjectCounts_maxOI : \
+						   ObjectCounts_maxOO)
+
+struct conv {
+	struct qcomtee_object *objs[CONV_MAX];
+	enum conv_ref refs[CONV_MAX];
+	size_t num;
+};
+
+static void conv_add(struct conv *conv, struct qcomtee_object *object,
+		     enum conv_ref ref)
+{
+	conv->objs[conv->num] = object;
+	conv->refs[conv->num] = ref;
+	conv->num++;
+}
+
+/* Drop what the conversions took; @delivered says whether QTEE got them. */
+static void conv_put(struct conv *conv, int delivered)
+{
+	for (size_t i = 0; i < conv->num; i++) {
+		if (conv->refs[i] == CONV_CREATED && !delivered)
+			qcomtee_object_refs_dec(conv->objs[i]);
+	}
+
+	conv->num = 0;
+}
+
+/*
+ * Per-request state of a callback. A request is dispatched and cleaned up
+ * on the same supplicant thread, after the response has been sent.
+ */
+struct cb_request {
+	/* Buffers allocated for the BO arguments of the MINK callee. */
+	void *bo[ObjectCounts_maxBO];
+	size_t num_bo;
+	/* OO references returned by the MINK callee. */
+	Object oo[ObjectCounts_maxOO];
+	size_t num_oo;
+	struct conv conv;
+};
+
+static __thread struct cb_request cb_req;
+
+static void cb_request_end(int delivered)
+{
+	conv_put(&cb_req.conv, delivered);
+
+	for (size_t i = 0; i < cb_req.num_oo; i++)
+		Object_release(cb_req.oo[i]);
+	cb_req.num_oo = 0;
+
+	for (size_t i = 0; i < cb_req.num_bo; i++)
+		free(cb_req.bo[i]);
+	cb_req.num_bo = 0;
+}
+
 /**
  * @brief Get a QCOMTEE object from a MINK object.
  *
  * @param root_object The root object associated with this invocation.
  * @param obj The MINK object to be converted to a QCOMTEE object.
  * @param object The QCOMTEE object converted from the MINK object.
+ * @param conv Records the references the conversion takes.
  * @return Returns Object_OK object on success.
  *         Returns Object_ERROR_* on failure.
  */
 static int32_t
 qcomtee_obj_from_mink_obj(struct qcomtee_object *root_object, Object obj,
-			  struct qcomtee_object **object)
+			  struct qcomtee_object **object, struct conv *conv)
 {
 	if (Object_isNull(obj)) {
 		*object = QCOMTEE_OBJECT_NULL;
@@ -46,7 +111,9 @@ qcomtee_obj_from_mink_obj(struct qcomtee_object *root_object, Object obj,
 	} else if (obj.invoke == invoke_over_tee) {
 		*object = (struct qcomtee_object *)obj.context;
 		return Object_OK;
-	} else {
+	}
+
+	{
 		struct qcomtee_callback_obj *qcomtee_cbo;
 
 		qcomtee_cbo = calloc(1, sizeof(*qcomtee_cbo));
@@ -61,6 +128,7 @@ qcomtee_obj_from_mink_obj(struct qcomtee_object *root_object, Object obj,
 		Object_retain(obj);
 
 		qcomtee_cbo->mink_obj = obj;
+		conv_add(conv, &qcomtee_cbo->object, CONV_CREATED);
 		*object = &qcomtee_cbo->object;
 		return Object_OK;
 	}
@@ -122,26 +190,6 @@ static ObjectCounts get_obj_counts(struct qcomtee_param *params,
 }
 
 /**
- * @brief Release QCOMTEE objects in the event of marshalling failure.
- *
- * @param params List of QCOMTEE parameters.
- * @param num Number of parameters in the params list.
- * @param attr Type of QCOMTEE objects to release QCOMTEE_OBJREF_INPUT
- *             or QCOMTEE_OBJREF_OUTPUT.
- */
-static void release_qcomtee_objs(struct qcomtee_param *params,
-				 uint32_t num_params, uint64_t attr)
-{
-	if (attr != QCOMTEE_OBJREF_INPUT && attr != QCOMTEE_OBJREF_OUTPUT)
-		return;
-
-	for (uint32_t i = 0; i < num_params; i++) {
-		if (params[i].attr == attr)
-			qcomtee_object_refs_dec(params[i].object);
-	}
-}
-
-/**
  * @brief Convert QCOMTEE parameters to MINK arguments during callback
  * processing.
  *
@@ -153,10 +201,8 @@ static void release_qcomtee_objs(struct qcomtee_param *params,
  */
 static int32_t object_args_from_tee_params_cb(struct qcomtee_param *params,
 					      uint32_t num_params,
-					      ObjectArg *args,
-					      void **allocated_bo)
+					      ObjectArg *args)
 {
-	uint32_t bo = 0;
 	uint32_t i = 0;
 	void *ubuf_ptr = NULL;
 
@@ -170,13 +216,13 @@ static int32_t object_args_from_tee_params_cb(struct qcomtee_param *params,
 			/* params[i].ubuf.addr is NULL for UBUF_OUTPUT */
 			ubuf_ptr = malloc(params[i].ubuf.size);
 			if (!ubuf_ptr)
-				goto out_failed;
+				return Object_ERROR_MEM;
 
 			args[i].b.ptr = ubuf_ptr;
 			args[i].b.size = params[i].ubuf.size;
 
 			/* Account for it, we'll free it later during cleanup */
-			allocated_bo[bo++] = args[i].b.ptr;
+			cb_req.bo[cb_req.num_bo++] = ubuf_ptr;
 			break;
 		case QCOMTEE_OBJREF_INPUT:
 			args[i].o = mink_obj_from_qcomtee_obj(params[i].object);
@@ -189,14 +235,6 @@ static int32_t object_args_from_tee_params_cb(struct qcomtee_param *params,
 	}
 
 	return Object_OK;
-
-out_failed:
-	for (i = 0; i < bo; i++) {
-		if (allocated_bo[i])
-			free(allocated_bo[i]);
-	}
-
-	return Object_ERROR;
 }
 
 /**
@@ -231,16 +269,22 @@ static int32_t object_args_to_tee_params_cb(ObjectArg *args,
 		params[i].attr = QCOMTEE_OBJREF_INPUT;
 	}
 
+	/* Hold the returned references until QTEE has received its own. */
 	FOR_ARGS(i, counts, OO) {
 		params[i].attr = QCOMTEE_OBJREF_OUTPUT;
-		if(qcomtee_obj_from_mink_obj(root, args[i].o, &params[i].object))
-			goto out_failed;
+		if (!Object_isNull(args[i].o))
+			cb_req.oo[cb_req.num_oo++] = args[i].o;
+	}
+
+	FOR_ARGS(i, counts, OO) {
+		int32_t ret = qcomtee_obj_from_mink_obj(root, args[i].o,
+							&params[i].object,
+							&cb_req.conv);
+		if (ret)
+			return ret;
 	}
 
 	return Object_OK;
-
-out_failed:
-	return Object_ERROR;
 }
 
 /**
@@ -268,23 +312,16 @@ qcomtee_callback_obj_dispatch(struct qcomtee_object *object, qcomtee_op_t op,
 	ObjectArg objArgs[MAX_OBJ_ARG_COUNT] = { { { 0, 0 } } };
 	ObjectCounts counts = get_obj_counts(params, num);
 
-	ret = object_args_from_tee_params_cb(params, num, objArgs,
-					     qcomtee_cbo->allocated_bo);
-	if (ret)
-		return ret;
-
-	ret = Object_invoke(qcomtee_cbo->mink_obj, op, objArgs, counts);
-	if (!ret) {
+	ret = object_args_from_tee_params_cb(params, num, objArgs);
+	if (!ret)
+		ret = Object_invoke(qcomtee_cbo->mink_obj, op, objArgs, counts);
+	if (!ret)
 		ret = object_args_to_tee_params_cb(objArgs, counts, params,
 						   root);
-		if (ret) {
-			release_qcomtee_objs(params, num,
-					     QCOMTEE_OBJREF_OUTPUT);
 
-			/* If dispatch fails, QCOMTEE doesn't call cleanup */
-			qcomtee_callback_obj_cleanup(object, 0);
-		}
-	}
+	/* If dispatch fails, QCOMTEE doesn't call cleanup */
+	if (ret)
+		cb_request_end(0);
 
 	return ret;
 }
@@ -301,14 +338,9 @@ qcomtee_callback_obj_dispatch(struct qcomtee_object *object, qcomtee_op_t op,
  */
 static void qcomtee_callback_obj_cleanup(struct qcomtee_object *object, int err)
 {
-	(void)err;
-	struct qcomtee_callback_obj *qcomtee_cbo = CALLBACKOBJ(object);
-	uint32_t i = 0;
+	(void)object;
 
-	for (i = 0; i < ObjectCounts_maxBO; i++) {
-		if (qcomtee_cbo->allocated_bo[i])
-			free(qcomtee_cbo->allocated_bo[i]);
-	}
+	cb_request_end(!err);
 }
 
 /**
@@ -334,12 +366,14 @@ static void qcomtee_callback_obj_release(struct qcomtee_object *object)
  * @param counts Mask encoding the number and type of arguments in args.
  * @param params List of QCOMTEE parameters.
  * @param root The root object associated with this invocation.
+ * @param conv Records the references the conversions take.
  * @return Object_OK on success.
- *         Object_ERROR on failure.
+ *         Object_ERROR_* on failure.
  */
 static int32_t object_args_to_tee_params(ObjectArg *args, ObjectCounts counts,
 					 struct qcomtee_param *params,
-					 struct qcomtee_object *root)
+					 struct qcomtee_object *root,
+					 struct conv *conv)
 {
 	FOR_ARGS(i, counts, BI) {
 		params[i].attr = QCOMTEE_UBUF_INPUT;
@@ -354,9 +388,13 @@ static int32_t object_args_to_tee_params(ObjectArg *args, ObjectCounts counts,
 	}
 
 	FOR_ARGS(i, counts, OI) {
+		int32_t ret;
+
 		params[i].attr = QCOMTEE_OBJREF_INPUT;
-		if(qcomtee_obj_from_mink_obj(root, args[i].o, &params[i].object))
-			goto out_failed;
+		ret = qcomtee_obj_from_mink_obj(root, args[i].o,
+						&params[i].object, conv);
+		if (ret)
+			return ret;
 	}
 
 	FOR_ARGS(i, counts, OO) {
@@ -364,9 +402,6 @@ static int32_t object_args_to_tee_params(ObjectArg *args, ObjectCounts counts,
 	}
 
 	return Object_OK;
-
-out_failed:
-	return Object_ERROR;
 }
 
 /**
@@ -421,6 +456,7 @@ static int invoke_over_tee(ObjectCxt cxt, ObjectOp op, ObjectArg *args,
 {
 	int ret = Object_OK;
 	struct qcomtee_param params[ObjectCounts_total(counts)];
+	struct conv conv = { .num = 0 };
 	qcomtee_result_t result;
 
 	struct qcomtee_object *object = (struct qcomtee_object *)cxt;
@@ -445,35 +481,29 @@ static int invoke_over_tee(ObjectCxt cxt, ObjectOp op, ObjectArg *args,
 		}
 	}
 
-	ret = object_args_to_tee_params(args, counts, params, object->root);
-	if (ret)
-		goto err_marshal_in;
+	ret = object_args_to_tee_params(args, counts, params, object->root,
+					&conv);
+	if (ret) {
+		conv_put(&conv, 0);
+		return ret;
+	}
 
 	if (qcomtee_object_invoke(object, op, params,
 				  ObjectCounts_total(counts), &result)) {
 		MSGE("Failed qcomtee_object_invoke\n");
-		ret = Object_ERROR;
-		goto err_marshal_in;
+		conv_put(&conv, 0);
+		return Object_ERROR;
 	}
+
+	/* qcomtee_object_invoke was successful; QTEE releases OI. */
+	conv_put(&conv, 1);
 
 	if (result) {
 		MSGD("Failed qcomtee_object_invoke. result = 0x%x\n", result);
-		ret = result;
-		goto err_result;
+		return result;
 	}
 
-	ret = object_args_from_tee_params(params, args, counts);
-
-err_result:
-	/* qcomtee_object_invoke was successful; QTEE releases OI. */
-
-	return ret;
-
-err_marshal_in:
-	release_qcomtee_objs(params, ObjectCounts_total(counts),
-			     QCOMTEE_OBJREF_INPUT);
-
-	return ret;
+	return object_args_from_tee_params(params, args, counts);
 }
 
 int MinkCom_getRootEnvObject(Object *obj)
@@ -540,11 +570,14 @@ int MinkCom_getClientEnvObjectWithCreds(Object rootObj, Object creds,
 	struct qcomtee_object *root = (struct qcomtee_object *)rootObj.context;
 	struct qcomtee_object *creds_object;
 	struct qcomtee_param params[2];
+	struct conv conv = { .num = 0 };
 	qcomtee_result_t result;
 
-	ret = qcomtee_obj_from_mink_obj(root, creds, &creds_object);
-	if (ret)
+	ret = qcomtee_obj_from_mink_obj(root, creds, &creds_object, &conv);
+	if (ret) {
+		conv_put(&conv, 0);
 		return ret;
+	}
 
 	params[0].attr = QCOMTEE_OBJREF_INPUT;
 	params[0].object = creds_object;
@@ -552,10 +585,12 @@ int MinkCom_getClientEnvObjectWithCreds(Object rootObj, Object creds,
 
 	/* 5 is IClientEnv_OP_registerWithCredentials. */
 	if (qcomtee_object_invoke(root, 2, params, 2, &result)) {
-		ret = Object_ERROR;
 		MSGE("Failed qcomtee_object_invoke\n");
-		goto err_object_invoke;
+		conv_put(&conv, 0);
+		return Object_ERROR;
 	}
+
+	conv_put(&conv, 1);
 
 	if (result) {
 		MSGE("Failed qcomtee_object_invoke. result = 0x%x\n", result);
@@ -567,11 +602,6 @@ int MinkCom_getClientEnvObjectWithCreds(Object rootObj, Object creds,
 
 err_result:
 	/* qcomtee_object_invoke was successful; QTEE releases creds_object. */
-
-	return ret;
-
-err_object_invoke:
-	qcomtee_object_refs_dec(creds_object);
 
 	return ret;
 }
